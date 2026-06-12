@@ -5,6 +5,11 @@
   "no_agg_suffix": false,
   "preview_examples": 3,
   "merge_key": "path",
+  "merge_nested": false,
   "output_dir": "./out_all",
-  "audit_file": "./audit.json"
+  "audit_file": "./audit.json",
+  "check": false,
+  "fail_fast": false,
+  "incremental": false,
+  "recursive": false
 }

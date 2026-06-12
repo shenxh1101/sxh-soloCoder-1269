@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-06-13T05:10:47",
+  "total_files": 2,
+  "summary": {
+    "ok": 0,
+    "empty": 0,
+    "fail": 0,
+    "skipped": 2
+  },
+  "files": [
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\report_east.csv",
+      "output": "out_incr\\report_east.json",
+      "status": "skipped",
+      "error": null,
+      "skip_reason": "output newer than source (mtime)",
+      "merge_key": null,
+      "total_rows": 0,
+      "output_groups": 0,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": false,
+      "header_only": false,
+      "timestamp": "2026-06-13T05:10:47"
+    },
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\report_west.csv",
+      "output": "out_incr\\report_west.json",
+      "status": "skipped",
+      "error": null,
+      "skip_reason": "output newer than source (mtime)",
+      "merge_key": null,
+      "total_rows": 0,
+      "output_groups": 0,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": false,
+      "header_only": false,
+      "timestamp": "2026-06-13T05:10:47"
+    }
+  ]
+}

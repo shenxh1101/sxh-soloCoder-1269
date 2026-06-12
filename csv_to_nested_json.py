@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSV to nested JSON converter — production-ready with batch, audit, and more."""
+"""CSV to nested JSON converter — production-ready with batch, audit, checks, and incremental."""
 
 import argparse
 import csv
@@ -16,12 +16,25 @@ SUPPORTED_AGG_FUNCS = ('sum', 'avg', 'count', 'min', 'max')
 LEAF_MODES = ('auto', 'object', 'array', 'scalar')
 MERGE_KEY_STRATEGIES = ('name', 'path', 'fullpath')
 
+_UNSET = object()
+
+_APPEND_FIELDS = {'agg', 'agg_as'}
+
 
 # ---------- helpers ----------
 
 def _deep_set(d, keys, value):
     for k in keys[:-1]:
         if k not in d:
+            d[k] = {}
+        d = d[k]
+    d[keys[-1]] = value
+
+
+def _deep_merge(d, keys, value):
+    """Like _deep_set but intermediates can be non-dict — overwrite leaf if conflict."""
+    for k in keys[:-1]:
+        if k not in d or not isinstance(d[k], dict):
             d[k] = {}
         d = d[k]
     d[keys[-1]] = value
@@ -75,6 +88,14 @@ def _read_csv(input_source):
                 return rows, reader.fieldnames
         except FileNotFoundError:
             raise
+
+
+def _file_signature(file_path):
+    """Return (mtime, size) tuple for a file, or None if it doesn't exist."""
+    if file_path == '-' or not os.path.isfile(file_path):
+        return None
+    st = os.stat(file_path)
+    return (st.st_mtime, st.st_size)
 
 
 # ---------- input discovery & output path safety ----------
@@ -134,12 +155,7 @@ def compute_merge_key(file_path, strategy, roots=None):
 
 
 def build_safe_batch_output_paths(files, output_dir=None, explicit_output=None):
-    """Map each input file to a safe output path, avoiding overwrites.
-
-    - If explicit_output is set and multiple files: raise ValueError (user error).
-    - Else output paths are based on basename (or unique path if collisions exist).
-    - Collision is resolved by embedding the relative path, then adding _1, _2...
-    """
+    """Map each input file to a safe output path, avoiding overwrites."""
     if explicit_output is not None and len(files) > 1:
         raise ValueError(
             "Multiple input files with a single -o/--output is not allowed. "
@@ -153,7 +169,6 @@ def build_safe_batch_output_paths(files, output_dir=None, explicit_output=None):
     out_map = {}
     seen = defaultdict(list)
 
-    # First pass: compute "preferred" name, detect collisions
     for fp in files:
         if fp == '-':
             preferred = '(stdin).json'
@@ -161,13 +176,11 @@ def build_safe_batch_output_paths(files, output_dir=None, explicit_output=None):
             preferred = os.path.splitext(os.path.basename(fp))[0] + '.json'
         seen[preferred].append(fp)
 
-    # Second pass: assign final paths, resolving collisions
     for preferred, fplist in seen.items():
         if len(fplist) == 1:
             fp = fplist[0]
             out_map[fp] = os.path.join(output_dir, preferred) if output_dir else preferred
         else:
-            # Collision — use relative path, then numeric disambiguation for any remaining
             path_map = {}
             for fp in fplist:
                 if fp == '-':
@@ -180,7 +193,6 @@ def build_safe_batch_output_paths(files, output_dir=None, explicit_output=None):
                     rel = rel.replace('/', '__').replace('\\', '__')
                 path_map[fp] = rel
 
-            # Check if the rel-based names still collide
             rel_seen = defaultdict(list)
             for fp, rel in path_map.items():
                 rel_seen[rel + '.json'].append(fp)
@@ -222,9 +234,15 @@ def default_args_dict():
         'output_dir': None,
         'merge': False,
         'merge_key': 'path',
+        'merge_nested': False,
         'recursive': False,
         'preview_examples': 5,
         'audit_file': None,
+        'check': False,
+        'fail_fast': False,
+        'incremental': False,
+        'dry_run': False,
+        'settings_summary': False,
     }
 
 
@@ -255,50 +273,72 @@ def _parse_agg_as_from_config(agg_as_cfg):
     return agg_as_list
 
 
+def _cli_provided(args, field):
+    """Check if a field was explicitly provided via CLI.
+
+    For append-action fields (agg, agg_as), non-empty means CLI provided.
+    For others, _UNSET sentinel is used.
+    """
+    if field in _APPEND_FIELDS:
+        val = getattr(args, field, None)
+        return isinstance(val, list) and len(val) > 0
+    return getattr(args, field, _UNSET) is not _UNSET
+
+
 def apply_config_tracked(args, config, defaults):
     """Apply config settings, tracking origin (cli > config > default).
 
-    Returns (args, origins) where origins[field] = ORIGIN_CLI | CONFIG | DEFAULT.
+    Returns (args, origins, effective) where origins[field] = CLI/CONFIG/DEFAULT
+    and effective[field] holds the final resolved value.
     """
     origins = {}
+    effective = {}
 
-    def resolve(field, cli_val, config_key=None, default=None):
+    def resolve(field, config_key=None, default=None):
         ckey = config_key or field
+
         if field in ('agg', 'agg_as'):
-            if cli_val:
+            if _cli_provided(args, field):
+                cli_val = getattr(args, field)
                 origins[field] = ORIGIN_CLI
+                effective[field] = cli_val
                 return cli_val
             if ckey in config:
                 if field == 'agg':
+                    parsed = _parse_agg_from_config(config[ckey])
                     origins[field] = ORIGIN_CONFIG
-                    return _parse_agg_from_config(config[ckey])
+                    effective[field] = parsed
+                    return parsed
                 if field == 'agg_as':
+                    parsed = _parse_agg_as_from_config(config[ckey])
                     origins[field] = ORIGIN_CONFIG
-                    return _parse_agg_as_from_config(config[ckey])
+                    effective[field] = parsed
+                    return parsed
             origins[field] = ORIGIN_DEFAULT
+            effective[field] = default or []
             return default or []
 
-        if cli_val is not None and cli_val != defaults.get(field):
-            if field == 'indent' and cli_val != 2:
-                origins[field] = ORIGIN_CLI
-                return cli_val
-            if field != 'indent':
-                origins[field] = ORIGIN_CLI
-                return cli_val
+        if _cli_provided(args, field):
+            val = getattr(args, field)
+            origins[field] = ORIGIN_CLI
+            effective[field] = val
+            return val
         if ckey in config:
+            val = config[ckey]
             origins[field] = ORIGIN_CONFIG
-            return config[ckey]
+            effective[field] = val
+            return val
+        val = default
         origins[field] = ORIGIN_DEFAULT
-        return cli_val if cli_val is not None else default
+        effective[field] = val
+        return val
 
-    defaults_d = defaults
-    args.group = resolve('group', args.group, default=None) or args.group
-    args.values = resolve('values', args.values, default=None) or args.values
-    args.agg = resolve('agg', args.agg, default=[])
-    args.agg_as = resolve('agg_as', args.agg_as, default=[])
+    args.group = resolve('group', default=None)
+    args.values = resolve('values', default=None)
+    args.agg = resolve('agg', default=[])
+    args.agg_as = resolve('agg_as', default=[])
 
-    # boolean & scalar fields:
-    fields_to_resolve = [
+    scalar_fields = [
         ('no_agg_suffix', False),
         ('leaf_as', 'auto'),
         ('missing_value', None),
@@ -311,17 +351,18 @@ def apply_config_tracked(args, config, defaults):
         ('output_dir', None),
         ('merge', False),
         ('merge_key', 'path'),
+        ('merge_nested', False),
         ('recursive', False),
         ('preview_examples', 5),
         ('audit_file', None),
+        ('check', False),
+        ('fail_fast', False),
+        ('incremental', False),
+        ('dry_run', False),
+        ('settings_summary', False),
     ]
-    for fname, fdefault in fields_to_resolve:
-        cli_val = getattr(args, fname)
-        setattr(args, fname, resolve(fname, cli_val, default=fdefault))
-
-    # Also merge_key needs to be checked
-    if not hasattr(args, 'merge_key') or args.merge_key is None:
-        args.merge_key = 'path'
+    for fname, fdefault in scalar_fields:
+        setattr(args, fname, resolve(fname, default=fdefault))
 
     if args.merge_key not in MERGE_KEY_STRATEGIES:
         print(
@@ -330,34 +371,51 @@ def apply_config_tracked(args, config, defaults):
             file=sys.stderr
         )
         sys.exit(1)
+    if args.leaf_as not in LEAF_MODES:
+        print(
+            f"Error: Unknown --leaf-as mode '{args.leaf_as}'. "
+            f"Supported: {', '.join(LEAF_MODES)}",
+            file=sys.stderr
+        )
+        sys.exit(1)
 
-    return args, origins
+    return args, origins, effective
 
 
-def print_settings_summary(origins, config_path=None, verbose=False):
-    """Print a short summary of which settings came from where."""
+def print_settings_summary(origins, effective, config_path=None):
+    """Print a detailed summary of each setting, its origin, and its value."""
     tag = {ORIGIN_CLI: 'CLI', ORIGIN_CONFIG: 'config', ORIGIN_DEFAULT: 'default'}
-    print("=" * 60, file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
     print("[Settings] Effective configuration:", file=sys.stderr)
     if config_path:
         print(f"  Config file: {config_path}", file=sys.stderr)
+    print(file=sys.stderr)
 
-    cli_settings = []
-    cfg_settings = []
-    for field, origin in sorted(origins.items()):
-        if origin == ORIGIN_CLI:
-            cli_settings.append(field)
-        elif origin == ORIGIN_CONFIG:
-            cfg_settings.append(field)
+    for field in sorted(origins.keys()):
+        origin = origins[field]
+        val = effective.get(field)
+        val_str = _format_setting_value(field, val)
+        print(f"  {field:<22} = {val_str:<30} [{tag[origin]}]", file=sys.stderr)
 
-    if cli_settings:
-        print(f"  From CLI    : {', '.join(cli_settings)}", file=sys.stderr)
-    if cfg_settings:
-        print(f"  From config : {', '.join(cfg_settings)}", file=sys.stderr)
-    defaults_only = [f for f in origins if origins[f] == ORIGIN_DEFAULT]
-    if verbose and defaults_only:
-        print(f"  Defaults    : {len(defaults_only)} settings", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+
+
+def _format_setting_value(field, val):
+    if field == 'agg' and val:
+        return ', '.join(f"{c}:{f}" for c, f in val)
+    if field == 'agg_as' and val:
+        return ', '.join(f"{c}→{n}" for c, n in val)
+    if field == 'group' and val:
+        return ' → '.join(val)
+    if field == 'values' and val:
+        return ', '.join(val)
+    if val is None:
+        return 'null'
+    if isinstance(val, bool):
+        return 'yes' if val else 'no'
+    if isinstance(val, int):
+        return str(val)
+    return str(val)
 
 
 # ---------- value column / output field resolution ----------
@@ -582,7 +640,6 @@ def convert_file(input_source, group_cols, value_cols, agg_map, agg_rename_map,
         stats['empty_csv'] = True
         stats['header_only'] = bool(fieldnames)
 
-    # convert defaultdicts to plain dicts for JSON serialization
     for k in ('missing_value_rows', 'non_numeric_values'):
         if isinstance(stats.get(k), defaultdict):
             stats[k] = dict(stats[k])
@@ -590,7 +647,200 @@ def convert_file(input_source, group_cols, value_cols, agg_map, agg_rename_map,
     return result, stats, None
 
 
-# ---------- dry-run / preview ----------
+# ---------- dry-run / preview / check ----------
+
+def _collect_file_checks(fp, group_cols, value_cols, agg_map, missing_value, preview_examples):
+    """Run all checks on a single file and return a result dict."""
+    result = {
+        'file': fp,
+        'status': 'ok',
+        'errors': [],
+        'warnings': [],
+        'info': {},
+    }
+    try:
+        rows, fieldnames = _read_csv(fp)
+    except FileNotFoundError:
+        result['status'] = 'error'
+        result['errors'].append('File not found')
+        return result
+    except Exception as e:
+        result['status'] = 'error'
+        result['errors'].append(f'Cannot read: {e}')
+        return result
+
+    result['info']['columns'] = list(fieldnames) if fieldnames else []
+    result['info']['total_rows'] = len(rows)
+
+    if not rows and not fieldnames:
+        result['info']['empty_completely'] = True
+        result['warnings'].append('File is completely empty (no header, no data)')
+        return result
+    if not rows:
+        result['info']['header_only'] = True
+        result['warnings'].append('Header only, no data rows')
+        return result
+
+    missing_group = [c for c in group_cols if c not in fieldnames]
+    missing_values = [c for c in value_cols if c not in fieldnames]
+    if missing_group:
+        result['errors'].append(f'Missing group columns: {", ".join(missing_group)}')
+    if missing_values:
+        result['errors'].append(f'Missing value columns: {", ".join(missing_values)}')
+    if missing_group or missing_values:
+        result['status'] = 'error'
+        return result
+
+    grouped, stats = preflight_and_group_rows(
+        rows, fieldnames, group_cols, value_cols, agg_map,
+        missing_value, warn_missing=False, warn_duplicates=False
+    )
+    result['info'].update({
+        'unique_group_keys': stats['unique_group_keys'],
+        'missing_group_rows': stats['missing_group_rows'],
+        'missing_value_rows': dict(stats['missing_value_rows']),
+    })
+
+    if stats['missing_group_rows'] > 0:
+        result['warnings'].append(f"{stats['missing_group_rows']} rows with missing group values")
+    for col, cnt in stats['missing_value_rows'].items():
+        if cnt > 0:
+            result['warnings'].append(f"Missing values in column '{col}': {cnt} rows")
+
+    agg_cols = [c for c in value_cols if c in agg_map]
+    dup_keys = [(k, v) for k, v in grouped.items() if len(v) > 1]
+    result['info']['aggregated_groups'] = len(dup_keys)
+    if dup_keys and agg_cols:
+        agg_detail = []
+        for gk, grows in dup_keys[:preview_examples]:
+            path_str = ' → '.join(str(p) for p in list(gk))
+            per_col = []
+            for col in agg_cols:
+                valid = 0
+                for r in grows:
+                    v = r.get(col, '')
+                    if v and v != '':
+                        try:
+                            float(v)
+                            valid += 1
+                        except (ValueError, TypeError):
+                            continue
+                per_col.append(f"{col}({valid}/{len(grows)} valid)")
+            agg_detail.append((path_str, len(grows), per_col))
+        result['info']['agg_detail_examples'] = agg_detail
+        result['info']['agg_detail_remaining'] = max(0, len(dup_keys) - preview_examples)
+
+    non_num = defaultdict(int)
+    for gk, grows in grouped.items():
+        for col in agg_cols:
+            for row in grows:
+                v = row.get(col, '')
+                if v == '' or v is None:
+                    continue
+                try:
+                    float(v)
+                except (ValueError, TypeError):
+                    non_num[col] += 1
+    result['info']['non_numeric_values'] = dict(non_num)
+    for col, cnt in non_num.items():
+        if cnt > 0:
+            result['warnings'].append(
+                f"Non-numeric values in aggregated column '{col}': {cnt} (will be skipped)"
+            )
+
+    if not grouped:
+        result['warnings'].append('No valid groups after filtering')
+        result['info']['no_output_groups'] = True
+
+    if result['warnings'] and result['status'] == 'ok':
+        result['status'] = 'warn'
+
+    return result
+
+
+def run_check_report(input_paths, group_cols, value_cols, agg_map, missing_value,
+                     recursive, preview_examples, fail_fast=False):
+    """Run check mode: validate all files, optionally fail fast on errors."""
+    files = discover_inputs(input_paths, recursive=recursive)
+    if not files:
+        print("[Check] No CSV files found.", file=sys.stderr)
+        sys.exit(1)
+
+    print("=" * 68)
+    print("[Check] Validation Report")
+    print("=" * 68)
+    print(f"[Check] Files to validate: {len(files)}")
+    for f in files:
+        print(f"  - {f}")
+    print()
+
+    errors_total = 0
+    warnings_total = 0
+    ok_count = 0
+    warn_count = 0
+    error_count = 0
+
+    for fp in files:
+        label = fp if fp != '-' else '<stdin>'
+        print("-" * 60)
+        print(f"[Check] File: {label}")
+
+        check_result = _collect_file_checks(
+            fp, group_cols, value_cols, agg_map, missing_value, preview_examples
+        )
+
+        info = check_result['info']
+        if 'columns' in info:
+            print(f"  Columns ({len(info['columns'])}): {', '.join(info['columns'][:8])}"
+                  + ('...' if len(info['columns']) > 8 else ''))
+            print(f"  Total rows: {info.get('total_rows', 0)}")
+            if 'unique_group_keys' in info:
+                print(f"  Unique group keys: {info['unique_group_keys']}")
+                print(f"  Aggregated groups: {info.get('aggregated_groups', 0)}")
+                if info.get('agg_detail_examples'):
+                    print("  Aggregated group examples:")
+                    for path_str, nrows, per_col in info['agg_detail_examples']:
+                        print(f"    * {path_str}  x{nrows} rows — {', '.join(per_col)}")
+                    if info.get('agg_detail_remaining', 0) > 0:
+                        print(f"    ... and {info['agg_detail_remaining']} more")
+
+        for w in check_result['warnings']:
+            print(f"  [Warning] {w}")
+            warnings_total += 1
+        for e in check_result['errors']:
+            print(f"  [Error]   {e}")
+            errors_total += 1
+
+        status = check_result['status']
+        if status == 'ok':
+            ok_count += 1
+            print(f"  Status: OK")
+        elif status == 'warn':
+            warn_count += 1
+            print(f"  Status: OK (with warnings)")
+        elif status == 'error':
+            error_count += 1
+            print(f"  Status: FAILED")
+            if fail_fast:
+                print(file=sys.stderr)
+                print("[Check] --fail-fast: stopping on first error.", file=sys.stderr)
+                print("=" * 68)
+                sys.exit(1)
+
+    print("-" * 60)
+    print("=" * 68)
+    print(f"[Check] Summary: {len(files)} files — "
+          f"{ok_count} OK, {warn_count} with warnings, {error_count} errors")
+    if warnings_total > 0:
+        print(f"[Check] Total warnings: {warnings_total}")
+    if errors_total > 0:
+        print(f"[Check] Total errors: {errors_total}")
+        print("[Check] Issues found — please review the errors above.")
+        print("=" * 68)
+        sys.exit(1)
+    print("[Check] All files passed validation. Ready to convert.")
+    print("=" * 68)
+
 
 def dry_run_report(input_paths, group_cols, value_cols, agg_map, agg_rename_map,
                    leaf_mode, missing_value, recursive, agg_func_suffix, preview_examples=5):
@@ -703,9 +953,9 @@ def dry_run_report(input_paths, group_cols, value_cols, agg_map, agg_rename_map,
                                 continue
                     agg_in_group.append(f"{col}({valid_vals}/{len(grows)} valid)")
                 if agg_in_group:
-                    print(f"    ▶ {path_str}  x{len(grows)} rows — {', '.join(agg_in_group)}")
+                    print(f"    * {path_str}  x{len(grows)} rows — {', '.join(agg_in_group)}")
                 else:
-                    print(f"    ▶ {path_str}  x{len(grows)} rows")
+                    print(f"    * {path_str}  x{len(grows)} rows")
             remaining = dup - len(dup_keys[:preview_examples])
             if remaining > 0:
                 print(f"    ... and {remaining} more aggregated groups")
@@ -766,12 +1016,14 @@ def dry_run_report(input_paths, group_cols, value_cols, agg_map, agg_rename_map,
 
 # ---------- audit file ----------
 
-def build_audit_entry(file_path, output_path, stats, status, error=None, merge_key=None):
+def build_audit_entry(file_path, output_path, stats, status, error=None, merge_key=None,
+                      skip_reason=None):
     entry = {
         'input': '(stdin)' if file_path == '-' else os.path.abspath(file_path),
         'output': output_path,
-        'status': status,  # ok / empty / fail
+        'status': status,  # ok / empty / fail / skipped
         'error': error,
+        'skip_reason': skip_reason,
         'merge_key': merge_key,
         'total_rows': stats.get('total_rows', 0),
         'output_groups': stats.get('output_groups', 0),
@@ -795,6 +1047,7 @@ def write_audit_file(audit_path, audit_entries):
             'ok': sum(1 for e in audit_entries if e['status'] == 'ok'),
             'empty': sum(1 for e in audit_entries if e['status'] == 'empty'),
             'fail': sum(1 for e in audit_entries if e['status'] == 'fail'),
+            'skipped': sum(1 for e in audit_entries if e['status'] == 'skipped'),
         },
         'files': audit_entries,
     }
@@ -803,29 +1056,53 @@ def write_audit_file(audit_path, audit_entries):
         f.write('\n')
 
 
+# ---------- incremental helpers ----------
+
+def should_skip_incremental(input_path, output_path):
+    """Check if we can skip conversion because output is newer than input.
+
+    Returns (skip: bool, reason: str or None).
+    """
+    if input_path == '-':
+        return False, None
+    if not output_path or not os.path.isfile(output_path):
+        return False, None
+    in_sig = _file_signature(input_path)
+    out_sig = _file_signature(output_path)
+    if not in_sig or not out_sig:
+        return False, None
+    in_mtime, _ = in_sig
+    out_mtime, _ = out_sig
+    if out_mtime >= in_mtime:
+        return True, 'output newer than source (mtime)'
+    return False, None
+
+
 # ---------- argument parser ----------
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description='Convert CSV to nested JSON with grouping, aggregation, batch processing, and audit.'
+        description='Convert CSV to nested JSON with grouping, aggregation, batch, check, audit, and incremental.'
     )
     parser.add_argument('input', nargs='+',
                         help='Input CSV file(s), directory, or "-" for stdin')
-    parser.add_argument('-o', '--output', default=None,
+    parser.add_argument('-o', '--output', default=_UNSET,
                         help='Output JSON file path (single file only — use --output-dir for batch)')
-    parser.add_argument('--output-dir', default=None,
+    parser.add_argument('--output-dir', default=_UNSET,
                         help='Directory for per-file batch outputs')
-    parser.add_argument('--merge', action='store_true',
+    parser.add_argument('--merge', action='store_true', default=_UNSET,
                         help='Merge all results into a single JSON')
-    parser.add_argument('--merge-key', default=None, choices=MERGE_KEY_STRATEGIES,
+    parser.add_argument('--merge-key', default=_UNSET, choices=MERGE_KEY_STRATEGIES,
                         help='Merge key strategy: name (basename), path (relative, default), fullpath (absolute)')
-    parser.add_argument('-r', '--recursive', action='store_true',
+    parser.add_argument('--merge-nested', action='store_true', default=_UNSET,
+                        help='Nest merged results by directory path instead of flat keys')
+    parser.add_argument('-r', '--recursive', action='store_true', default=_UNSET,
                         help='Recursively scan directories for CSV files')
     parser.add_argument('-c', '--config', default=None,
                         help='JSON config file with group/values/agg/options')
-    parser.add_argument('--group', nargs='+', default=None,
+    parser.add_argument('--group', nargs='+', default=_UNSET,
                         help='Columns to group by (in order of nesting)')
-    parser.add_argument('--values', nargs='+', default=None,
+    parser.add_argument('--values', nargs='+', default=_UNSET,
                         help='Columns to use as leaf values')
     parser.add_argument('--agg', nargs=2, action='append', default=[],
                         metavar=('COLUMN', 'FUNC'),
@@ -835,29 +1112,35 @@ def build_parser():
     parser.add_argument('--agg-as', nargs=2, action='append', default=[],
                         metavar=('COLUMN', 'OUTPUT_NAME'),
                         help='Rename an output field, e.g. --agg-as sales sales_total')
-    parser.add_argument('--no-agg-suffix', action='store_true',
+    parser.add_argument('--no-agg-suffix', action='store_true', default=_UNSET,
                         help='Do not add function suffix to aggregated field names')
-    parser.add_argument('--leaf-as', default=None, choices=LEAF_MODES,
+    parser.add_argument('--leaf-as', default=_UNSET, choices=LEAF_MODES,
                         help='Leaf structure: auto (default), object, array, scalar')
-    parser.add_argument('--indent', type=int, default=2,
+    parser.add_argument('--indent', type=int, default=_UNSET,
                         help='Indentation spaces for pretty JSON (default: 2)')
-    parser.add_argument('--no-indent', action='store_true',
+    parser.add_argument('--no-indent', action='store_true', default=_UNSET,
                         help='Output compact JSON without indentation')
-    parser.add_argument('--missing-value', default=None,
+    parser.add_argument('--missing-value', default=_UNSET,
                         help='Value to use for missing data (default: null/None)')
-    parser.add_argument('--no-warn-missing', action='store_true',
+    parser.add_argument('--no-warn-missing', action='store_true', default=_UNSET,
                         help='Disable warnings for missing values')
-    parser.add_argument('--no-warn-duplicates', action='store_true',
+    parser.add_argument('--no-warn-duplicates', action='store_true', default=_UNSET,
                         help='Disable warnings for duplicate group keys')
-    parser.add_argument('--sort-keys', action='store_true',
+    parser.add_argument('--sort-keys', action='store_true', default=_UNSET,
                         help='Sort keys in output JSON')
-    parser.add_argument('--dry-run', '--preview', action='store_true', dest='dry_run',
+    parser.add_argument('--dry-run', '--preview', action='store_true', dest='dry_run', default=_UNSET,
                         help='Preview mode: validate, show aggregated groups & examples, do not write output')
-    parser.add_argument('--preview-examples', type=int, default=5,
-                        help='Number of example paths / aggregated groups in preview')
-    parser.add_argument('--settings-summary', action='store_true',
-                        help='Print a summary of effective settings (CLI vs config vs defaults)')
-    parser.add_argument('--audit-file', default=None,
+    parser.add_argument('--check', action='store_true', default=_UNSET,
+                        help='Validation check mode: verify all inputs, show pass/warn/fail per file')
+    parser.add_argument('--fail-fast', action='store_true', default=_UNSET,
+                        help='With --check: stop on first error found')
+    parser.add_argument('--incremental', action='store_true', default=_UNSET,
+                        help='Skip files where output JSON is newer than source CSV')
+    parser.add_argument('--preview-examples', type=int, default=_UNSET,
+                        help='Number of example paths / aggregated groups in preview (default: 5)')
+    parser.add_argument('--settings-summary', action='store_true', default=_UNSET,
+                        help='Print a detailed summary of effective settings with origins and values')
+    parser.add_argument('--audit-file', default=_UNSET,
                         help='Write a JSON audit file with per-file stats and status')
     return parser
 
@@ -868,25 +1151,22 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     origins = None
+    effective = None
 
     if args.config:
         config = load_config(args.config)
         defaults = default_args_dict()
-        args, origins = apply_config_tracked(args, config, defaults)
+        args, origins, effective = apply_config_tracked(args, config, defaults)
     else:
-        # Fill defaults for tracking fields that the parser has raw defaults on
-        if args.leaf_as is None:
-            args.leaf_as = 'auto'
-        if args.merge_key is None:
-            args.merge_key = 'path'
-        if args.audit_file is None:
-            args.audit_file = None
+        defaults = default_args_dict()
+        for fname, fdefault in defaults.items():
+            if not _cli_provided(args, fname):
+                setattr(args, fname, fdefault)
+        origins = _build_default_origins(args)
+        effective = {k: getattr(args, k) for k in defaults}
 
     if args.settings_summary:
-        if origins is None:
-            # Build a minimal origins dict from CLI presence check
-            origins = build_default_origins(args)
-        print_settings_summary(origins, args.config, verbose=True)
+        print_settings_summary(origins, effective, args.config)
 
     warnings.simplefilter('always')
 
@@ -911,6 +1191,13 @@ def main():
         )
         sys.exit(1)
 
+    if args.check:
+        run_check_report(
+            args.input, group_cols, value_cols, agg_map, args.missing_value,
+            args.recursive, args.preview_examples, fail_fast=args.fail_fast,
+        )
+        return
+
     if args.dry_run:
         dry_run_report(
             args.input, group_cols, value_cols, agg_map, agg_rename_map,
@@ -924,7 +1211,6 @@ def main():
         print("Error: No CSV files found to process.", file=sys.stderr)
         sys.exit(1)
 
-    # Safety check: multi-file + single -o (and not --merge) is error
     if not args.merge and args.output and len(files) > 1:
         print(
             "Error: Multiple input files with a single -o/--output is not allowed. "
@@ -935,13 +1221,13 @@ def main():
 
     indent = None if args.no_indent else args.indent
     merged_results = {}
-    successes = []  # (label, stats, is_empty, output_path, merge_key)
+    successes = []
     failures = []
     empties = []
+    skips = []
     audit_entries = []
     input_roots = [os.path.abspath(p) if os.path.isdir(p) else os.getcwd() for p in args.input]
 
-    # Build safe output paths for non-merge batch mode
     safe_outputs = None
     if not args.merge and (len(files) > 1 or args.output_dir):
         try:
@@ -952,8 +1238,55 @@ def main():
 
     is_batch = (len(files) > 1) or args.merge or args.output_dir
 
+    merge_skip_all = False
+    merge_skip_reason = None
+    if args.merge and args.incremental and args.output:
+        real_files = [fp for fp in files if fp != '-']
+        if real_files:
+            latest_mtime = 0
+            latest_size = 0
+            for fp in real_files:
+                mtime, size = _file_signature(fp)
+                if mtime and mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_size = size
+            out_mtime, out_size = _file_signature(args.output)
+            if out_mtime and latest_mtime and out_mtime >= latest_mtime:
+                merge_skip_all = True
+                merge_skip_reason = f'merge output "{args.output}" is newer than all source files'
+
     for fp in files:
         label = '(stdin)' if fp == '-' else fp
+
+        out_path = None
+        if args.merge:
+            out_path = args.output
+        elif is_batch:
+            if safe_outputs:
+                out_path = safe_outputs.get(fp)
+            elif args.output and len(files) == 1:
+                out_path = args.output
+            else:
+                out_path = f"{os.path.splitext(os.path.basename(fp if fp != '-' else 'stdin'))[0]}.json"
+                if args.output_dir:
+                    out_path = os.path.join(args.output_dir, out_path)
+        else:
+            out_path = args.output if args.output else None
+
+        if args.incremental and fp != '-' and out_path:
+            if args.merge and merge_skip_all:
+                skip = True
+                reason = merge_skip_reason
+            else:
+                skip, reason = should_skip_incremental(fp, out_path)
+            if skip:
+                print(f"[SKIP] {label}: {reason}", file=sys.stderr)
+                skips.append((label, reason))
+                audit_entries.append(build_audit_entry(
+                    fp, out_path, {}, 'skipped', skip_reason=reason
+                ))
+                continue
+
         result, stats, err = convert_file(
             fp, group_cols, value_cols, dict(agg_map), agg_rename_map,
             args.leaf_as, args.missing_value,
@@ -961,14 +1294,12 @@ def main():
             agg_func_suffix,
         )
 
-        # --- failure ---
         if err is not None:
             print(f"[FAIL] {label}: {err}", file=sys.stderr)
             failures.append((label, err))
-            audit_entries.append(build_audit_entry(fp, None, {}, 'fail', error=err))
+            audit_entries.append(build_audit_entry(fp, out_path, {}, 'fail', error=err))
             continue
 
-        # --- empty inputs ---
         is_empty_result = stats.get('empty_result', False)
         if is_empty_result and stats.get('empty_csv'):
             if not stats.get('header_only'):
@@ -977,14 +1308,13 @@ def main():
                 msg = 'header only, no data rows'
             print(f"[EMPTY] {label}: {msg}", file=sys.stderr)
             empties.append((label, msg))
-            audit_entries.append(build_audit_entry(fp, None, stats, 'empty', error=msg))
+            audit_entries.append(build_audit_entry(fp, out_path, stats, 'empty', error=msg))
             continue
 
         if is_empty_result:
             msg = 'no output groups after grouping/filtering'
             print(f"[WARN]  {label}: {msg}", file=sys.stderr)
 
-        # --- non-numeric warnings ---
         non_num = stats.get('non_numeric_values', {})
         for col, cnt in non_num.items():
             if cnt > 0 and not args.no_warn_missing:
@@ -992,60 +1322,51 @@ def main():
                     f"{label}: {cnt} non-numeric values skipped in aggregated column '{col}'"
                 )
 
-        # --- output ---
         mk = None
         if args.merge:
             mk = compute_merge_key(fp, args.merge_key, roots=input_roots)
-            if mk in merged_results:
-                existing = merged_results[mk]
-                i = 2
-                while f"{mk}_{i}" in merged_results:
-                    i += 1
-                warnings.warn(f"Duplicate merge key '{mk}' for '{fp}' — renamed to '{mk}_{i}'")
-                mk = f"{mk}_{i}"
-            merged_results[mk] = result
-            out_path = None
-        elif is_batch:
-            if fp == '-' and not args.output_dir and not args.output:
-                print(json.dumps(result, indent=indent, sort_keys=args.sort_keys, ensure_ascii=False))
-                out_path = None
+            if args.merge_nested:
+                key_parts = mk.split('/') if mk != '(stdin)' else [mk]
+                _deep_merge(merged_results, key_parts, result)
             else:
-                out_path = (args.output if args.output else
-                            (safe_outputs.get(fp) if safe_outputs else None))
-                if out_path is None:
-                    out_path = f"{os.path.splitext(os.path.basename(fp if fp != '-' else 'stdin'))[0]}.json"
-                    if args.output_dir:
-                        out_path = os.path.join(args.output_dir, out_path)
-                try:
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(result, indent=indent, sort_keys=args.sort_keys, ensure_ascii=False))
-                        f.write('\n')
-                    print(f"[OK]   {label} → {out_path}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[FAIL] {label}: write error: {e}", file=sys.stderr)
-                    failures.append((label, f'write error: {e}'))
-                    audit_entries.append(build_audit_entry(fp, out_path, stats, 'fail', error=f'write error: {e}'))
-                    continue
+                if mk in merged_results:
+                    i = 2
+                    while f"{mk}_{i}" in merged_results:
+                        i += 1
+                    warnings.warn(f"Duplicate merge key '{mk}' for '{fp}' — renamed to '{mk}_{i}'")
+                    mk = f"{mk}_{i}"
+                merged_results[mk] = result
+            actual_out_path = None
+        elif is_batch:
+            actual_out_path = out_path
+            try:
+                with open(actual_out_path, 'w', encoding='utf-8') as f:
+                    f.write(json.dumps(result, indent=indent, sort_keys=args.sort_keys, ensure_ascii=False))
+                    f.write('\n')
+                print(f"[OK]   {label} → {actual_out_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"[FAIL] {label}: write error: {e}", file=sys.stderr)
+                failures.append((label, f'write error: {e}'))
+                audit_entries.append(build_audit_entry(fp, actual_out_path, stats, 'fail', error=f'write error: {e}'))
+                continue
         else:
-            # single file, non-batch
             output_str = json.dumps(result, indent=indent, sort_keys=args.sort_keys, ensure_ascii=False)
             if args.output:
                 with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(output_str)
                     f.write('\n')
                 print(f"[OK]   {label} → {args.output}", file=sys.stderr)
-                out_path = args.output
+                actual_out_path = args.output
             else:
                 print(output_str)
-                out_path = None
+                actual_out_path = None
 
-        successes.append((label, stats, is_empty_result, out_path, mk))
-        audit_entries.append(build_audit_entry(fp, out_path, stats,
+        successes.append((label, stats, is_empty_result, actual_out_path, mk))
+        audit_entries.append(build_audit_entry(fp, actual_out_path, stats,
                                                'empty' if is_empty_result else 'ok',
                                                merge_key=mk))
 
-    # --- merged output ---
-    if args.merge:
+    if args.merge and not merge_skip_all:
         output_str = json.dumps(merged_results, indent=indent, sort_keys=args.sort_keys, ensure_ascii=False)
         if args.output:
             with open(args.output, 'w', encoding='utf-8') as f:
@@ -1055,24 +1376,33 @@ def main():
         else:
             print(output_str)
 
-    # --- summary ---
     if is_batch:
         total = len(files)
         ok = len([s for s in successes if not s[2]])
         empty = len([s for s in successes if s[2]]) + len(empties)
         fail = len(failures)
+        skip = len(skips)
         print(file=sys.stderr)
-        print("=" * 50, file=sys.stderr)
-        print(f"Summary: {total} file(s) — {ok} OK, {empty} empty, {fail} failed", file=sys.stderr)
+        print("=" * 58, file=sys.stderr)
+        parts = [f"{ok} OK"]
+        if skip:
+            parts.append(f"{skip} skipped")
+        if empty:
+            parts.append(f"{empty} empty")
+        if fail:
+            parts.append(f"{fail} failed")
+        print(f"Summary: {total} file(s) — " + ", ".join(parts), file=sys.stderr)
         if failures:
             print("Failures:", file=sys.stderr)
             for label, err in failures:
                 print(f"  - {label}: {err}", file=sys.stderr)
-        print("=" * 50, file=sys.stderr)
+        if skips:
+            print("Skipped:", file=sys.stderr)
+            for label, reason in skips:
+                print(f"  - {label}: {reason}", file=sys.stderr)
+        print("=" * 58, file=sys.stderr)
 
-    # --- audit file ---
     if args.audit_file:
-        # Update merge outputs' output_path in audit entries
         if args.merge and args.output:
             for e in audit_entries:
                 if e['status'] in ('ok', 'empty') and e.get('merge_key'):
@@ -1084,28 +1414,15 @@ def main():
         sys.exit(2)
 
 
-def build_default_origins(args):
-    """Fallback origins generator when no config file is used."""
+def _build_default_origins(args):
+    """Build origins dict when no config file is used."""
+    defaults = default_args_dict()
     origins = {}
-    origins['group'] = ORIGIN_CLI if args.group else ORIGIN_DEFAULT
-    origins['values'] = ORIGIN_CLI if args.values else ORIGIN_DEFAULT
-    origins['agg'] = ORIGIN_CLI if args.agg else ORIGIN_DEFAULT
-    origins['agg_as'] = ORIGIN_CLI if args.agg_as else ORIGIN_DEFAULT
-    origins['no_agg_suffix'] = ORIGIN_CLI if args.no_agg_suffix else ORIGIN_DEFAULT
-    origins['leaf_as'] = ORIGIN_CLI if args.leaf_as and args.leaf_as != 'auto' else ORIGIN_DEFAULT
-    origins['missing_value'] = ORIGIN_CLI if args.missing_value is not None else ORIGIN_DEFAULT
-    origins['no_warn_missing'] = ORIGIN_CLI if args.no_warn_missing else ORIGIN_DEFAULT
-    origins['no_warn_duplicates'] = ORIGIN_CLI if args.no_warn_duplicates else ORIGIN_DEFAULT
-    origins['indent'] = ORIGIN_CLI if args.indent != 2 else ORIGIN_DEFAULT
-    origins['no_indent'] = ORIGIN_CLI if args.no_indent else ORIGIN_DEFAULT
-    origins['sort_keys'] = ORIGIN_CLI if args.sort_keys else ORIGIN_DEFAULT
-    origins['output'] = ORIGIN_CLI if args.output else ORIGIN_DEFAULT
-    origins['output_dir'] = ORIGIN_CLI if args.output_dir else ORIGIN_DEFAULT
-    origins['merge'] = ORIGIN_CLI if args.merge else ORIGIN_DEFAULT
-    origins['merge_key'] = ORIGIN_CLI if args.merge_key and args.merge_key != 'path' else ORIGIN_DEFAULT
-    origins['recursive'] = ORIGIN_CLI if args.recursive else ORIGIN_DEFAULT
-    origins['preview_examples'] = ORIGIN_CLI if args.preview_examples != 5 else ORIGIN_DEFAULT
-    origins['audit_file'] = ORIGIN_CLI if args.audit_file else ORIGIN_DEFAULT
+    for field in defaults:
+        if _cli_provided(args, field):
+            origins[field] = ORIGIN_CLI
+        else:
+            origins[field] = ORIGIN_DEFAULT
     return origins
 
 

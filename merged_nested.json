@@ -1,0 +1,58 @@
+{
+  "report_east": {
+    "East": {
+      "Shanghai": {
+        "sales_sum": 2000,
+        "quantity_avg": 60
+      },
+      "Hangzhou": {
+        "sales_sum": 1500,
+        "quantity_avg": 45
+      },
+      "Nanjing": {
+        "sales_sum": 700,
+        "quantity_avg": 25
+      }
+    }
+  },
+  "report_west": {
+    "West": {
+      "Chengdu": {
+        "sales_sum": 1400,
+        "quantity_avg": 25
+      },
+      "Chongqing": {
+        "sales_sum": 1100,
+        "quantity_avg": 26.5
+      }
+    }
+  },
+  "2024q1": {
+    "report": {
+      "North": {
+        "Beijing": {
+          "sales_sum": 100,
+          "quantity_avg": 10
+        },
+        "Shanghai": {
+          "sales_sum": 200,
+          "quantity_avg": 20
+        }
+      }
+    }
+  },
+  "2024q2": {
+    "report": {
+      "South": {
+        "Guangzhou": {
+          "sales_sum": 300,
+          "quantity_avg": 30
+        },
+        "Shenzhen": {
+          "sales_sum": 400,
+          "quantity_avg": 40
+        }
+      }
+    }
+  }
+}
