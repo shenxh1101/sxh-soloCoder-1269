@@ -1,0 +1,10 @@
+{
+  "group": ["region", "city"],
+  "agg": {"sales": "sum", "quantity": "avg"},
+  "leaf_as": "object",
+  "no_agg_suffix": false,
+  "preview_examples": 3,
+  "merge_key": "path",
+  "output_dir": "./out_all",
+  "audit_file": "./audit.json"
+}

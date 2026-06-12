@@ -1,0 +1,22 @@
+{
+  "North": {
+    "Beijing": {
+      "sales_sum": 2600,
+      "quantity_avg": 30
+    },
+    "Shanghai": {
+      "sales_sum": 1800,
+      "quantity_avg": 32.5
+    }
+  },
+  "South": {
+    "Guangzhou": {
+      "sales_sum": 2900,
+      "quantity_avg": 47.5
+    },
+    "Shenzhen": {
+      "sales_sum": 2500,
+      "quantity_avg": 41.5
+    }
+  }
+}

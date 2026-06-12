@@ -1,0 +1,26 @@
+{
+  "generated_at": "2026-06-13T04:53:42",
+  "total_files": 1,
+  "summary": {
+    "ok": 1,
+    "empty": 0,
+    "fail": 0
+  },
+  "files": [
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\sample.csv",
+      "output": "sample_test.json",
+      "status": "ok",
+      "error": null,
+      "merge_key": null,
+      "total_rows": 10,
+      "output_groups": 4,
+      "missing_group_rows": 1,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": false,
+      "header_only": false,
+      "timestamp": "2026-06-13T04:53:42"
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "generated_at": "2026-06-13T04:53:27",
+  "total_files": 4,
+  "summary": {
+    "ok": 2,
+    "empty": 2,
+    "fail": 0
+  },
+  "files": [
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\empty_header_only.csv",
+      "output": null,
+      "status": "empty",
+      "error": "header only, no data rows",
+      "merge_key": null,
+      "total_rows": 0,
+      "output_groups": 0,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": true,
+      "header_only": true,
+      "timestamp": "2026-06-13T04:53:27"
+    },
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\empty_nothing.csv",
+      "output": null,
+      "status": "empty",
+      "error": "completely empty (no header, no data)",
+      "merge_key": null,
+      "total_rows": 0,
+      "output_groups": 0,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": true,
+      "header_only": false,
+      "timestamp": "2026-06-13T04:53:27"
+    },
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\report_east.csv",
+      "output": "out_audit\\report_east.json",
+      "status": "ok",
+      "error": null,
+      "merge_key": null,
+      "total_rows": 3,
+      "output_groups": 3,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {},
+      "empty_csv": false,
+      "header_only": false,
+      "timestamp": "2026-06-13T04:53:27"
+    },
+    {
+      "input": "D:\\code\\TraeProjects\\1269\\testdata\\report_west.csv",
+      "output": "out_audit\\report_west.json",
+      "status": "ok",
+      "error": null,
+      "merge_key": null,
+      "total_rows": 4,
+      "output_groups": 2,
+      "missing_group_rows": 0,
+      "missing_value_rows": {},
+      "non_numeric_values": {
+        "sales": 1
+      },
+      "empty_csv": false,
+      "header_only": false,
+      "timestamp": "2026-06-13T04:53:27"
+    }
+  ]
+}
