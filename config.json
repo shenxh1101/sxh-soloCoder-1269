@@ -1,0 +1,11 @@
+{
+  "group": ["region", "city"],
+  "values": ["quantity"],
+  "agg": {
+    "sales": "sum"
+  },
+  "indent": 2,
+  "sort_keys": true,
+  "no_warn_missing": false,
+  "no_warn_duplicates": false
+}
