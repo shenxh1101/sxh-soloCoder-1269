@@ -1,0 +1,12 @@
+{
+  "West": {
+    "Chengdu": {
+      "sales_sum": 1400,
+      "quantity_avg": 25
+    },
+    "Chongqing": {
+      "sales_sum": 1100,
+      "quantity_avg": 26.5
+    }
+  }
+}

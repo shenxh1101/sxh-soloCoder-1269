@@ -1,0 +1,5 @@
+region,city,product,sales,quantity
+West,Chengdu,Apple,900,30
+West,Chengdu,Banana,500,20
+West,Chongqing,Apple,1100,35
+West,Chongqing,Banana,N/A,18

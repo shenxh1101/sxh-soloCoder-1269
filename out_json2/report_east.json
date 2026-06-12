@@ -1,0 +1,16 @@
+{
+  "East": {
+    "Shanghai": {
+      "sales_sum": 2000,
+      "quantity_avg": 60
+    },
+    "Hangzhou": {
+      "sales_sum": 1500,
+      "quantity_avg": 45
+    },
+    "Nanjing": {
+      "sales_sum": 700,
+      "quantity_avg": 25
+    }
+  }
+}
