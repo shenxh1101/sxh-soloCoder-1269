@@ -1,0 +1,11 @@
+region,city,product,sales,quantity
+North,Beijing,Apple,1500,50
+North,Beijing,Banana,800,30
+North,Shanghai,Apple,1200,40
+North,Shanghai,Banana,600,25
+South,Guangzhou,Apple,2000,60
+South,Guangzhou,Banana,900,35
+South,Shenzhen,Apple,1800,55
+South,Shenzhen,Banana,700,28
+North,Beijing,Apple,300,10
+South,,Apple,500,15
